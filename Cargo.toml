@@ -27,6 +27,7 @@ futures-core = {version = "*"}
 ctrlc = {version = "*"}
 winapi = {version = "*"}
 signal-hook = {version = "*", features = ["iterator", "channel"]}
+libc = {version = "*"}
 
 
 

@@ -7,6 +7,7 @@ use clap::{command, Parser};
 use colored::Colorize;
 use directories::ProjectDirs;
 use signal_hook::flag;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct App {
     data_dir: String,
@@ -70,7 +71,17 @@ struct StructStation {
 
 impl std::fmt::Display for StructStation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} [{}]", self.name.trim(), self.country)
+        write!(
+            f,
+            "{} [{}{}]",
+            self.name.trim(),
+            if self.state != "" {
+                format!("{}, ", self.state)
+            } else {
+                String::new()
+            },
+            self.country
+        )
     }
 }
 
@@ -146,118 +157,103 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let station_list = tokio::fs::read_to_string(format!("{}/stations.db", app.data_dir)).await?;
 
-    let station_list: Vec<StructStation> = serde_json::from_str(&station_list)?;
+    loop {
+        let station_list: Vec<StructStation> = serde_json::from_str(&station_list)?;
 
-    // Replace every blank name with "Unknown"
-    let station_list = station_list
-        .into_iter()
-        .map(|mut station| {
-            if station.name == "" {
-                station.name = String::from("Unknown");
-            }
-            station
-        })
-        .collect::<Vec<StructStation>>();
-
-    // Filter by country code
-
-    let station_list = if let Some(country) = app.args.country {
-        station_list
+        // Replace every blank name with "Unknown"
+        let station_list = station_list
             .into_iter()
-            .filter(|station| station.countrycode == country)
-            .collect::<Vec<StructStation>>()
-    } else {
-        station_list
-    };
+            .map(|mut station| {
+                if station.name == "" {
+                    station.name = String::from("Unknown");
+                }
+                station
+            })
+            .collect::<Vec<StructStation>>();
 
-    let mut country_code = String::new();
+        // Filter by country code
 
-    if app.args.countries {
-        let countries =
-            tokio::fs::read_to_string(format!("{}/countries.json", app.data_dir)).await?;
+        let station_list = if let Some(country) = &app.args.country {
+            station_list
+                .into_iter()
+                .filter(|station| &station.countrycode == country)
+                .collect::<Vec<StructStation>>()
+        } else {
+            station_list
+        };
 
-        let countries: Vec<Country> = serde_json::from_str(&countries)?;
+        let mut country_code = String::new();
 
-        println!("Country count: {}", countries.len());
+        if app.args.countries {
+            let countries =
+                tokio::fs::read_to_string(format!("{}/countries.json", app.data_dir)).await?;
 
-        let selection =
+            let countries: Vec<Country> = serde_json::from_str(&countries)?;
+
+            println!("Country count: {}", countries.len());
+
+            let selection =
+                dialoguer::FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                    .with_prompt("Select a country, or type to search")
+                    .items(&countries)
+                    .interact()?;
+
+            country_code = countries[selection].iso_3166_1.clone();
+        }
+
+        // Filter by language code
+
+        let station_list = station_list
+            .into_iter()
+            .filter(|station| station.countrycode == country_code)
+            .collect::<Vec<StructStation>>();
+
+        println!("Station count: {}", station_list.len());
+
+        if station_list.len() > 100 {
+            println!(
+                "{} - Station count is excessively large! Fuzzy searching will be very slow.",
+                "WARNING".yellow()
+            );
+
+            // Press enter to continue
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+        }
+
+        let station_selection =
             dialoguer::FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                .with_prompt("Select a country, or type to search")
-                .items(&countries)
+                .with_prompt("Select a station, or type to search")
+                .items(&station_list)
                 .interact()?;
 
-        country_code = countries[selection].iso_3166_1.clone();
-    }
+        println!("Selected station: {}", station_list[station_selection]);
 
-    // Filter by language code
-
-    let station_list = station_list
-        .into_iter()
-        .filter(|station| station.countrycode == country_code)
-        .collect::<Vec<StructStation>>();
-
-    println!("Station count: {}", station_list.len());
-
-    if station_list.len() > 100 {
         println!(
-            "{} - Station count is excessively large! Fuzzy searching will be very slow.",
-            "WARNING".yellow()
+            "Attempting to connect to {}...",
+            station_list[station_selection].url
         );
 
-        // Press enter to continue
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
+        #[cfg(target_os = "windows")]
+        let mut vlc_command = tokio::process::Command::new(vlc_location.unwrap())
+            .arg("-I")
+            .arg("dummy")
+            .arg("--dummy-quiet")
+            .arg("--volume")
+            .arg(app.args.volume.to_string())
+            .arg(&station_list[station_selection].url)
+            .spawn()?;
+
+        #[cfg(target_os = "linux")]
+        let mut vlc_command = tokio::process::Command::new("cvlc")
+            .arg("--play-and-exit")
+            .arg(&station_list[station_selection].url)
+            .spawn()?;
+
+        // Wait for VLC to exit
+
+        vlc_command.wait().await?;
     }
-
-    let station_selection =
-        dialoguer::FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
-            .with_prompt("Select a station, or type to search")
-            .items(&station_list)
-            .interact()?;
-
-    println!("Selected station: {}", station_list[station_selection]);
-
-    println!(
-        "Attempting to connect to {}...",
-        station_list[station_selection].url
-    );
-
-    let mut vlc_command = tokio::process::Command::new(vlc_location.unwrap())
-        .arg("-I")
-        .arg("dummy")
-        .arg("--dummy-quiet")
-        .arg("--volume")
-        .arg(app.args.volume.to_string())
-        .arg(&station_list[station_selection].url)
-        .spawn()?;
-
-    let vlc_pid = vlc_command.id().unwrap() as i32;
-
-    ctrlc::set_handler(move || {
-        if vlc_pid != -1 {
-            println!("Killing VLC... {}", vlc_pid);
-
-            kill_process(vlc_pid);
-        }
-    })?;
-
-    tokio::spawn(async move {
-        while !term.load(std::sync::atomic::Ordering::Relaxed) {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            // Kill VLC if it's not running
-
-            if vlc_pid != -1 {
-                kill_process(vlc_pid);
-            }
-        }
-    });
-
-    vlc_command.wait().await?;
-
-    println!("Exited VLC");
-
-    Ok(())
 }
 
 async fn get_db(data_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
